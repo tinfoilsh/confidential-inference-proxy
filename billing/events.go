@@ -1,7 +1,10 @@
 package billing
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -20,19 +23,44 @@ type Event struct {
 	Enclave          string    `json:"enclave"`
 	RequestPath      string    `json:"request_path"`
 	Streaming        bool      `json:"streaming"`
+	APIKey           string    `json:"api_key"`
 }
 
-// Collector collects billing events in memory and logs them
+// ShadowBillingRequest represents the payload sent to the control plane
+type ShadowBillingRequest struct {
+	Events []Event `json:"events"`
+	Source string  `json:"source"` // "proxy" to distinguish from tfshim
+}
+
+// Collector collects billing events in memory and sends them to the control plane
 type Collector struct {
-	events []Event
-	mu     sync.Mutex
+	events        []Event
+	mu            sync.Mutex
+	controlPlane  string
+	batchInterval time.Duration
+	quit          chan struct{}
+	wg            sync.WaitGroup
 }
 
 // NewCollector creates a new billing event collector
-func NewCollector() *Collector {
-	return &Collector{
-		events: make([]Event, 0),
+func NewCollector(controlPlaneURL string) *Collector {
+	c := &Collector{
+		events:        make([]Event, 0),
+		controlPlane:  controlPlaneURL,
+		batchInterval: 2 * time.Second, // Match tfshim's interval
+		quit:          make(chan struct{}),
 	}
+
+	// Only start batch processing if control plane URL is provided
+	if controlPlaneURL != "" {
+		c.wg.Add(1)
+		go c.processBatch()
+		log.Infof("Billing collector started with control plane: %s", controlPlaneURL)
+	} else {
+		log.Info("Billing collector started in log-only mode (no control plane URL)")
+	}
+
+	return c
 }
 
 // AddEvent adds a billing event and logs it
@@ -70,4 +98,87 @@ func (c *Collector) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.events = c.events[:0]
+}
+
+// Stop gracefully shuts down the collector
+func (c *Collector) Stop() {
+	close(c.quit)
+	c.wg.Wait()
+}
+
+// processBatch runs in a goroutine and periodically sends batched events
+func (c *Collector) processBatch() {
+	defer c.wg.Done()
+
+	ticker := time.NewTicker(c.batchInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.sendBatch()
+		case <-c.quit:
+			// Send any remaining events before shutting down
+			c.sendBatch()
+			return
+		}
+	}
+}
+
+// sendBatch sends the current batch of events to the control plane
+func (c *Collector) sendBatch() {
+	c.mu.Lock()
+	if len(c.events) == 0 {
+		c.mu.Unlock()
+		return
+	}
+
+	// Copy events and clear the queue
+	batch := make([]Event, len(c.events))
+	copy(batch, c.events)
+	c.events = c.events[:0]
+	c.mu.Unlock()
+
+	// Create the request payload
+	payload := ShadowBillingRequest{
+		Events: batch,
+		Source: "proxy",
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		log.WithError(err).Error("Failed to marshal billing batch")
+		return
+	}
+
+	// Send to control plane
+	url := fmt.Sprintf("%s/api/shim/collect-shadow", c.controlPlane)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.WithError(err).Error("Failed to create billing request")
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.WithError(err).WithField("url", url).Error("Failed to send billing batch")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.WithFields(log.Fields{
+			"status": resp.StatusCode,
+			"url":    url,
+		}).Error("Billing batch submission failed")
+		return
+	}
+
+	log.WithField("event_count", len(batch)).Debug("Successfully sent billing batch")
 }

@@ -95,6 +95,7 @@ func newProxy(host, publicKeyFP, modelName string, billingCollector *billing.Col
 				event := billing.Event{
 					Timestamp:        time.Now(),
 					UserID:           userID,
+					APIKey:           userID, // API key is passed as Bearer token
 					Model:            modelName,
 					PromptTokens:     usage.PromptTokens,
 					CompletionTokens: usage.CompletionTokens,
@@ -167,6 +168,13 @@ func (em *EnclaveManager) Models() map[string]*Model {
 		return true
 	})
 	return models
+}
+
+// StopBillingCollector gracefully stops the billing collector
+func (em *EnclaveManager) StopBillingCollector() {
+	if em.billingCollector != nil {
+		em.billingCollector.Stop()
+	}
 }
 
 // UpdateModel update's a model's tag and measurement, and all enclave's measurements
@@ -259,7 +267,7 @@ func (em *EnclaveManager) DeleteEnclave(modelName, host string) error {
 }
 
 // NewEnclaveManager loads model repos from the config, verifies them, and returns a map of verified models
-func NewEnclaveManager(configFile []byte) (*EnclaveManager, error) {
+func NewEnclaveManager(configFile []byte, controlPlaneURL string) (*EnclaveManager, error) {
 	var config struct {
 		Models map[string]string `json:"models"` // model name -> repo
 	}
@@ -323,6 +331,6 @@ func NewEnclaveManager(configFile []byte) (*EnclaveManager, error) {
 		em.models.Store(k, v)
 	}
 
-	em.billingCollector = billing.NewCollector()
+	em.billingCollector = billing.NewCollector(controlPlaneURL)
 	return em, nil
 }
