@@ -33,8 +33,9 @@ type Model struct {
 	SourceMeasurement *attestation.Measurement `json:"measurement"`
 	Enclaves          []*Enclave               `json:"enclaves"`
 
-	counter uint64
-	mu      sync.RWMutex
+	counter     uint64
+	mu          sync.RWMutex
+	lastUpdated time.Time
 }
 
 type EnclaveManager struct {
@@ -58,7 +59,7 @@ func (em *EnclaveManager) GetModel(modelName string) (*Model, bool) {
 	return model.(*Model), true
 }
 
-func newProxy(host, publicKeyFP, modelName string, billingCollector *billing.Collector) *httputil.ReverseProxy {
+func newProxy(host, publicKeyFP, modelName string, billingCollector *billing.Collector, em *EnclaveManager) *httputil.ReverseProxy {
 	httpClient := &http.Client{
 		Transport: &tinfoilClient.TLSBoundRoundTripper{
 			ExpectedPublicKey: publicKeyFP,
@@ -69,6 +70,43 @@ func newProxy(host, publicKeyFP, modelName string, billingCollector *billing.Col
 		Host:   host,
 	})
 	proxy.Transport = httpClient.Transport
+
+	// Attempt model update on connection verification failure
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		model, found := em.GetModel(modelName)
+		if !found {
+			log.WithError(err).Errorf("Model %s not found", modelName)
+			http.Error(w, fmt.Sprintf("Model %s not found", modelName), http.StatusBadGateway)
+			return
+		}
+
+		// Check if this is a TLS verification error
+		if strings.Contains(err.Error(), "certificate") || strings.Contains(err.Error(), "tls") || strings.Contains(err.Error(), "verification") {
+			if time.Since(model.lastUpdated) < 10*time.Second {
+				log.WithError(err).Warnf("Connection verification failed for enclave %s, skipping model update", host)
+				http.Error(w, "Connection verification failed, model updated. Please retry your request.", http.StatusBadGateway)
+				return
+			}
+			model.lastUpdated = time.Now()
+
+			log.WithError(err).Warnf("Connection verification failed for enclave %s, attempting to update model %s", host, modelName)
+
+			// Try to update the model measurements and recreate the proxy
+			if updateErr := em.UpdateModel(modelName); updateErr != nil {
+				log.WithError(updateErr).Errorf("Failed to update model %s after connection verification failure", modelName)
+				http.Error(w, fmt.Sprintf("Connection verification failed and model update failed: %v", updateErr), http.StatusBadGateway)
+				return
+			}
+
+			log.Infof("Successfully updated model %s after connection verification failure", modelName)
+			http.Error(w, "Connection verification failed, model updated. Please retry your request.", http.StatusBadGateway)
+			return
+		}
+
+		// For other errors, use default error handling
+		log.WithError(err).Errorf("Proxy error for enclave %s", host)
+		http.Error(w, fmt.Sprintf("Proxy error: %v", err), http.StatusBadGateway)
+	}
 
 	// Add token extraction and billing via ModifyResponse
 	proxy.ModifyResponse = func(resp *http.Response) error {
@@ -168,7 +206,7 @@ func (em *EnclaveManager) AddEnclave(modelName, host string) error {
 	model.Enclaves = append(model.Enclaves, &Enclave{
 		host:        host,
 		publicKeyFP: verification.PublicKeyFP,
-		proxy:       newProxy(host, verification.PublicKeyFP, modelName, em.billingCollector),
+		proxy:       newProxy(host, verification.PublicKeyFP, modelName, em.billingCollector, em),
 	})
 	return nil
 }
@@ -200,7 +238,7 @@ func (em *EnclaveManager) updateModelMeasurements(modelName string) error {
 	model.mu.Lock()
 	defer model.mu.Unlock()
 
-	measurement, tag, hwMeasurements, err := verifyRepo(model.Repo, model.Tag)
+	measurement, tag, hwMeasurements, err := verifyRepo(model.Repo, "")
 	if err != nil {
 		return fmt.Errorf("failed to verify repo %s: %w", model.Repo, err)
 	}
@@ -228,7 +266,7 @@ func (em *EnclaveManager) UpdateModel(modelName string) error {
 			return fmt.Errorf("failed to verify enclave %s: %w", enclave.host, err)
 		}
 		enclave.publicKeyFP = verification.PublicKeyFP
-		enclave.proxy = newProxy(enclave.host, verification.PublicKeyFP, modelName, em.billingCollector)
+		enclave.proxy = newProxy(enclave.host, verification.PublicKeyFP, modelName, em.billingCollector, em)
 	}
 
 	return nil
