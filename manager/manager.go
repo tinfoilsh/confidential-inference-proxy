@@ -116,7 +116,7 @@ func newProxy(host, publicKeyFP, modelName string, billingCollector *billing.Col
 
 		// Check if client requested usage stats (from header set in main.go)
 		clientRequestedUsage := req.Header.Get("X-Tinfoil-Client-Requested-Usage") == "true"
-		
+
 		// Extract tokens with the usage handler
 		newBody, _, err := tokencount.ExtractTokensFromResponseWithHandler(resp, modelName, usageHandler, clientRequestedUsage)
 		if err != nil {
@@ -170,8 +170,8 @@ func (em *EnclaveManager) AddEnclave(modelName, host string) error {
 
 	model.Enclaves = append(model.Enclaves, &Enclave{
 		host:        host,
-		publicKeyFP: verification.PublicKeyFP,
-		proxy:       newProxy(host, verification.PublicKeyFP, modelName, em.billingCollector),
+		publicKeyFP: verification.TLSPublicKeyFP,
+		proxy:       newProxy(host, verification.TLSPublicKeyFP, modelName, em.billingCollector),
 	})
 	return nil
 }
@@ -230,8 +230,8 @@ func (em *EnclaveManager) UpdateModel(modelName string) error {
 		if err != nil {
 			return fmt.Errorf("failed to verify enclave %s: %w", enclave.host, err)
 		}
-		enclave.publicKeyFP = verification.PublicKeyFP
-		enclave.proxy = newProxy(enclave.host, verification.PublicKeyFP, modelName, em.billingCollector)
+		enclave.publicKeyFP = verification.TLSPublicKeyFP
+		enclave.proxy = newProxy(enclave.host, verification.TLSPublicKeyFP, modelName, em.billingCollector)
 	}
 
 	return nil
